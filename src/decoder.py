@@ -6,6 +6,7 @@ import threading
 import os
 import time
 import logging
+from typing import Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,10 @@ CUSTOM_TOKEN_SUFFIX = ">"
 MIN_FRAMES_FIRST = int(os.environ["MIN_FRAMES_FIRST"])
 MIN_FRAMES_SUBSEQ = int(os.environ["MIN_FRAMES_SUBSEQ"])
 PROCESS_EVERY = int(os.environ["PROCESS_EVERY"])
+
+# Audio processing configuration
+STREAM_CHUNK_SIZE_GROUPS = 30  # Number of token groups (7 tokens each) for processing
+INITIAL_CHUNK_SIZE_GROUPS = 5  # Smaller initial chunk for faster first audio
 
 def turn_token_into_id(token_string, index):
     """Convert a custom token string to its numeric ID.
@@ -105,6 +110,40 @@ def convert_to_audio(multiframe, count):
             return (audio_np * 32767.0).round().astype(np.int16).tobytes()
 
 
+def apply_fade(audio_data: bytes, sample_rate: int = 24000, fade_duration_ms: float = 10.0) -> bytes:
+    """Apply fade-in and fade-out to audio data to prevent clicks/pops.
+    
+    Args:
+        audio_data: Raw audio data in bytes (int16 format)
+        sample_rate: Sample rate in Hz (default: 24000)
+        fade_duration_ms: Duration of fade in/out in milliseconds (default: 10ms)
+        
+    Returns:
+        Faded audio data in bytes (int16 format)
+    """
+    # Convert bytes to numpy array of int16 and create a writable copy
+    audio_array = np.frombuffer(audio_data, dtype=np.int16).copy()
+    num_samples = len(audio_array)
+    
+    # Calculate number of samples for fade
+    fade_samples = int((fade_duration_ms / 1000.0) * sample_rate)
+    fade_samples = min(fade_samples, num_samples // 2)  # Ensure we don't overlap fades
+    
+    if fade_samples == 0 or num_samples < 2 * fade_samples:
+        return audio_data  # Not enough samples to apply fade
+    
+    # Create fade in/out curves (linear for simplicity, can be changed to other curves)
+    fade_in = np.linspace(0, 1, fade_samples, dtype=np.float32)
+    fade_out = np.linspace(1, 0, fade_samples, dtype=np.float32)
+    
+    # Apply fade in to first samples
+    audio_array[:fade_samples] = (audio_array[:fade_samples].astype(np.float32) * fade_in).astype(np.int16)
+    # Apply fade out to last samples
+    audio_array[-fade_samples:] = (audio_array[-fade_samples:].astype(np.float32) * fade_out).astype(np.int16)
+    
+    return audio_array.tobytes()
+
+
 async def tokens_decoder(token_gen):
     """Decode tokens into audio chunks with reduced latency.
 
@@ -112,25 +151,38 @@ async def tokens_decoder(token_gen):
     available, drastically reducing time-to-first-byte. Subsequent chunks are
     processed every 7 tokens using a sliding window of the last 4 frames (28
     tokens) mirroring the original behaviour.
-    """    
+    
+    Each audio chunk has a short fade in/out applied to prevent clicks/pops
+    when chunks are stitched together.
+    """
     buffer = []
     count = 0
     first_chunk_sent = False
+    sample_rate = 24000  # SNAC model sample rate
+    
+    # Calculate token counts for processing
+    initial_chunk_size = INITIAL_CHUNK_SIZE_GROUPS * 7  # 5 groups of 7 tokens
+    stream_chunk_size = STREAM_CHUNK_SIZE_GROUPS * 7    # 30 groups of 7 tokens
 
     async for token_sim in token_gen:
+        # Convert token string to ID
         token = turn_token_into_id(token_sim, count)
         if token is None or token <= 0:
             continue
 
         buffer.append(token)
         count += 1
-
-        if not first_chunk_sent and count >= MIN_FRAMES_FIRST:
-            audio = convert_to_audio(buffer[-MIN_FRAMES_FIRST:], count)
+        
+        # Process initial chunk
+        if not first_chunk_sent and len(buffer) >= MIN_FRAMES_FIRST * 7:
+            audio = convert_to_audio(buffer[-MIN_FRAMES_FIRST * 7:], count)
             if audio is not None:
+                audio = apply_fade(audio, sample_rate)
                 first_chunk_sent = True
                 yield audio
+        # Process subsequent chunks
         elif first_chunk_sent and count % PROCESS_EVERY == 0:
-            audio = convert_to_audio(buffer[-MIN_FRAMES_SUBSEQ:], count)
+            audio = convert_to_audio(buffer[-MIN_FRAMES_SUBSEQ * 7:], count)
             if audio is not None:
+                audio = apply_fade(audio, sample_rate)
                 yield audio

@@ -121,8 +121,8 @@ def apply_fade(audio_data: bytes, sample_rate: int = 24000, fade_duration_ms: fl
     Returns:
         Faded audio data in bytes (int16 format)
     """
-    # Convert bytes to numpy array of int16
-    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+    # Convert bytes to numpy array of int16 and create a writable copy
+    audio_array = np.frombuffer(audio_data, dtype=np.int16).copy()
     num_samples = len(audio_array)
     
     # Calculate number of samples for fade

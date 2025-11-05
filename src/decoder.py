@@ -36,9 +36,7 @@ MIN_FRAMES_FIRST = int(os.environ["MIN_FRAMES_FIRST"])
 MIN_FRAMES_SUBSEQ = int(os.environ["MIN_FRAMES_SUBSEQ"])
 PROCESS_EVERY = int(os.environ["PROCESS_EVERY"])
 
-# Audio token configuration
-CODE_START_TOKEN_ID = 128257  # Marks the beginning of audio tokens
-CODE_TOKEN_OFFSET = 128266    # Minimum valid token ID for audio
+# Audio processing configuration
 STREAM_CHUNK_SIZE_GROUPS = 30  # Number of token groups (7 tokens each) for processing
 INITIAL_CHUNK_SIZE_GROUPS = 5  # Smaller initial chunk for faster first audio
 
@@ -147,20 +145,20 @@ def apply_fade(audio_data: bytes, sample_rate: int = 24000, fade_duration_ms: fl
 
 
 async def tokens_decoder(token_gen):
-    """Decode tokens into audio chunks with special token handling and reduced latency.
+    """Decode tokens into audio chunks with reduced latency.
 
-    This decoder processes tokens with the following features:
-    - Looks for CODE_START_TOKEN_ID to identify the beginning of audio tokens
-    - Validates tokens are within the expected range (>= CODE_TOKEN_OFFSET)
-    - Uses configurable chunk sizes for initial and subsequent processing
-    - Applies fade-in/out to prevent clicks/pops between chunks
+    The first audio chunk is emitted as soon as **one** frame (7 tokens) is
+    available, drastically reducing time-to-first-byte. Subsequent chunks are
+    processed every 7 tokens using a sliding window of the last 4 frames (28
+    tokens) mirroring the original behaviour.
+    
+    Each audio chunk has a short fade in/out applied to prevent clicks/pops
+    when chunks are stitched together.
     """
     buffer = []
-    token_buffer = []
     count = 0
     first_chunk_sent = False
     sample_rate = 24000  # SNAC model sample rate
-    in_audio_sequence = False
     
     # Calculate token counts for processing
     initial_chunk_size = INITIAL_CHUNK_SIZE_GROUPS * 7  # 5 groups of 7 tokens
@@ -169,41 +167,22 @@ async def tokens_decoder(token_gen):
     async for token_sim in token_gen:
         # Convert token string to ID
         token = turn_token_into_id(token_sim, count)
-        if token is None:
+        if token is None or token <= 0:
             continue
-            
-        # Check for start of audio sequence
-        if token == CODE_START_TOKEN_ID and not in_audio_sequence:
-            in_audio_sequence = True
-            token_buffer = []
-            continue
-            
-        # If we're not in an audio sequence, skip processing
-        if not in_audio_sequence:
-            continue
-            
-        # Validate token is within expected range for audio
-        if token < CODE_TOKEN_OFFSET:
-            continue
-            
-        # Add valid audio token to buffer
-        token_buffer.append(token)
+
+        buffer.append(token)
         count += 1
         
-        # Determine if we have enough tokens to process
-        tokens_needed = initial_chunk_size if not first_chunk_sent else stream_chunk_size
-        
-        if len(token_buffer) >= tokens_needed:
-            # Process the tokens in groups of 7 (one audio frame)
-            num_frames = len(token_buffer) // 7
-            if num_frames > 0:
-                # Take complete frames (multiples of 7)
-                frames_to_process = token_buffer[:num_frames * 7]
-                token_buffer = token_buffer[num_frames * 7:]
-                
-                # Convert to audio
-                audio = convert_to_audio(frames_to_process, count)
-                if audio is not None:
-                    audio = apply_fade(audio, sample_rate)
-                    first_chunk_sent = True
-                    yield audio
+        # Process initial chunk
+        if not first_chunk_sent and len(buffer) >= MIN_FRAMES_FIRST * 7:
+            audio = convert_to_audio(buffer[-MIN_FRAMES_FIRST * 7:], count)
+            if audio is not None:
+                audio = apply_fade(audio, sample_rate)
+                first_chunk_sent = True
+                yield audio
+        # Process subsequent chunks
+        elif first_chunk_sent and count % PROCESS_EVERY == 0:
+            audio = convert_to_audio(buffer[-MIN_FRAMES_SUBSEQ * 7:], count)
+            if audio is not None:
+                audio = apply_fade(audio, sample_rate)
+                yield audio

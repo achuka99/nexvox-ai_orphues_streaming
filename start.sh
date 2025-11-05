@@ -7,7 +7,7 @@ export TRANSFORMERS_OFFLINE=0
 
 
 CUDA_VISIBLE_DEVICES=0 vllm serve crestai/english_uganda-orpheus-3b-finetuned \
---max-model-len 2048 \
+--max-model-len 4096 \
 --gpu-memory-utilization 0.85 \
 --host 0.0.0.0 \
 --port 9191 \
@@ -16,7 +16,8 @@ CUDA_VISIBLE_DEVICES=0 vllm serve crestai/english_uganda-orpheus-3b-finetuned \
 --enable-chunked-prefill \
 --disable-log-requests \
 --block-size 16 \
---enable-prefix-caching &
+--enable-prefix-caching \
+--quantization fp8 &
 
 
 CUDA_VISIBLE_DEVICES=1 uvicorn main:app \
